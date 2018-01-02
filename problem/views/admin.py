@@ -6,7 +6,7 @@ import zipfile
 from wsgiref.util import FileWrapper
 
 from django.conf import settings
-from django.http import StreamingHttpResponse, HttpResponse
+from django.http import StreamingHttpResponse, HttpResponse, FileResponse
 
 from account.decorators import problem_permission_required
 from judge.dispatcher import SPJCompiler
@@ -14,12 +14,13 @@ from contest.models import Contest, ContestStatus
 from submission.models import Submission
 from utils.api import APIView, CSRFExemptAPIView, validate_serializer
 from utils.shortcuts import rand_str, natural_sort_key
+from utils.tasks import delete_files
 
 from ..models import Problem, ProblemRuleType, ProblemTag
 from ..serializers import (CreateContestProblemSerializer, CompileSPJSerializer,
                            CreateProblemSerializer, EditProblemSerializer, EditContestProblemSerializer,
                            ProblemAdminSerializer, TestCaseUploadForm, ContestProblemMakePublicSerializer,
-                           AddContestProblemSerializer)
+                           AddContestProblemSerializer, ExportProblemSerializer)
 
 
 class TestCaseAPI(CSRFExemptAPIView):
@@ -470,3 +471,31 @@ class AddContestProblemAPI(APIView):
         problem.save()
         problem.tags.set(tags)
         return self.success()
+
+
+class ExportImportProblemAPI(APIView):
+    def get(self, request):
+        problem = Problem.objects.get(id=1)
+        info = ExportProblemSerializer(problem).data
+        compression = zipfile.ZIP_DEFLATED
+        name = f"/tmp/{rand_str()}.zip"
+        with zipfile.ZipFile(name, "w") as zip_file:
+            zip_file.writestr(zinfo_or_arcname="problem.json",
+                              data=json.dumps(info, indent=4),
+                              compress_type=compression)
+            problem_test_case_dir = os.path.join(settings.TEST_CASE_DIR, problem.test_case_id)
+            with open(os.path.join(problem_test_case_dir, "info")) as f:
+                info = json.load(f)
+            for k, v in info["test_cases"].items():
+                zip_file.write(filename=os.path.join(problem_test_case_dir, v["input_name"]),
+                               arcname=f"testcase/{v['input_name']}",
+                               compress_type=compression)
+                if not info["spj"]:
+                    zip_file.write(filename=os.path.join(problem_test_case_dir, v["output_name"]),
+                                   arcname=f"testcase/{v['output_name']}",
+                                   compress_type=compression)
+        delete_files.apply_async((name, ), countdown=300)
+        resp = FileResponse(open(name, "rb"))
+        resp["Content-Type"] = "application/zip"
+        resp["Content-Disposition"] = f"attachment;filename=problem-{problem.id}.zip"
+        return resp
